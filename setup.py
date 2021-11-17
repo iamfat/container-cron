@@ -5,8 +5,8 @@ from setuptools import setup, find_packages
 from shutil import rmtree
 
 here = os.path.abspath(os.path.dirname(__file__))
-package = 'containe_cron'
-version = '0.1.0'
+package = 'container_cron'
+version = '0.1.1'
 
 with codecs.open(os.path.join(here, 'README.md')) as f:
     long_description = '\n' + f.read()
