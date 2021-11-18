@@ -7,6 +7,8 @@ import json
 import threading
 import time
 import getopt
+import shlex
+
 from typing import Tuple, Union
 
 from tempfile import gettempdir
@@ -18,6 +20,7 @@ from containerd.services.containers.v1 import containers_pb2_grpc, containers_pb
 from containerd.services.events.v1 import unwrap, events_pb2, events_pb2_grpc
 from containerd.services.tasks.v1 import tasks_pb2, tasks_pb2_grpc
 
+from apscheduler.schedulers.base import BaseScheduler
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.triggers.cron import CronTrigger
@@ -135,9 +138,10 @@ def run_command(channel, container_id, args, timeout=5) -> Tuple[int, str]:
 
 
 def run_schedule(channel, container_id, args):
-    exit_code = run_command(channel, container_id, args)
+    exit_code, _ = run_command(channel, container_id, args)
     logging.getLogger('cron').info(
-        "{code} <- schedule {schedule}".format(code=exit_code, schedule=' '.join(args)))
+        "{code} <- schedule {schedule}".format(code=exit_code, schedule=shlex.join(args)))
+    return exit_code
 
 
 def get_os_id(channel, container_id):
@@ -161,6 +165,7 @@ def get_alpine_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
         return '', None
     return output.decode('utf8').replace('\t', ' '), user
 
+
 def get_debian_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
     exit_code, output = run_command(channel, container_id, ["/bin/sh", "-c",
                                                             '[ -d /etc/cron.d ] && find /etc/cron.d ! -name \".*\" -type f -exec cat \{\} \;'])
@@ -178,10 +183,11 @@ def get_container_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]
     return '', None
 
 
-def load_container_schedules(scheduler, container_id, channel):
-    logging.getLogger('cron').info(
-        'load schedules from {container_id}'.format(container_id=container_id))
+def parse_args(command: str):
+    return shlex.split(command)
 
+
+def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
     tab, user = get_container_crontab(channel, container_id)
     if tab == '':
         return
@@ -195,24 +201,26 @@ def load_container_schedules(scheduler, container_id, channel):
             slices = SPECIALS[slices.lstrip('@')]
         scheduler.add_job(run_schedule,
                           CronTrigger.from_crontab(slices),
-                          args=[channel, container_id, job.command],
+                          args=[channel, container_id,
+                                parse_args(job.command)],
                           name=job.command)
-
-
-def unload_container_schedules(scheduler, container_id):
     logging.getLogger('cron').info(
-        'unload schedules from {container_id}'.format(container_id=container_id))
+        'load schedules from {container_id}, {jobs} jobs now.'.format(container_id=container_id, jobs=len(scheduler.get_jobs())))
 
+
+def unload_container_schedules(scheduler: BaseScheduler, container_id):
     for job in scheduler.get_jobs():
         # 若存储器中的任务所属容器当前不存在，则在存储请中删除此任务
-        if job.args[0] == container_id:
+        if job.args[1] == container_id:
             scheduler.remove_job(job_id=job.id)
+    logging.getLogger('cron').info(
+        'unload schedules from {container_id}, {jobs} jobs left.'.format(container_id=container_id, jobs=len(scheduler.get_jobs())))
 
 
 def main():
     try:
-        opts, args = getopt.getopt(sys.argv[1:], 's:n:', [
-                                   'cri-socket=', 'namespace='])
+        opts, _ = getopt.getopt(sys.argv[1:], 's:n:', [
+            'cri-socket=', 'namespace='])
     except getopt.GetoptError as e:
         print('Usage: --cri-socket|-s <SOCKET> --namespace|-n <NAMESPACE>')
         exit(1)
