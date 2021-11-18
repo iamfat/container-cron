@@ -212,6 +212,8 @@ def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
     container_spec = get_container_spec(channel, container_id)
     container_name = get_container_name(
         container_spec) if not None else container_id
+    logger.info(
+        'load schedules from [{container_name}]...'.format(container_name=container_name))
 
     cron_jobs = CronTab(tab=tab, user=user)
     for job in cron_jobs:
@@ -225,20 +227,23 @@ def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
                           args=[channel, container_id,
                                 parse_args(job.command)],
                           name=job.command)
-        logger.info(
+        logger.debug(
             'found [{container_name}]: {job}.'.format(job=job.command, container_name=container_name))
 
     logger.info(
-        'load schedules from [{container_name}], {jobs} jobs now.'.format(container_name=container_name, jobs=len(scheduler.get_jobs())))
+        'got {job_count} schedules now.'.format(job_count=len(scheduler.get_jobs())))
 
 
 def unload_container_schedules(scheduler: BaseScheduler, container_id):
-    for job in scheduler.get_jobs():
+    jobs = scheduler.get_jobs()
+    job_count = len(jobs)
+    for job in jobs:
         # 若存储器中的任务所属容器当前不存在，则在存储请中删除此任务
         if job.args[1] == container_id:
             scheduler.remove_job(job_id=job.id)
+            job_count -= 1
     logging.getLogger('cron').info(
-        'unload schedules from [{container_id}], {jobs} jobs left.'.format(container_id=container_id, jobs=len(scheduler.get_jobs())))
+        'some schedules removed, {job_count} left.'.format(job_count=job_count))
 
 
 def main():

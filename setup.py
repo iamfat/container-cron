@@ -6,7 +6,7 @@ from shutil import rmtree
 
 here = os.path.abspath(os.path.dirname(__file__))
 package = 'container_cron'
-version = '0.2.1'
+version = '0.2.2'
 
 with codecs.open(os.path.join(here, 'README.md')) as f:
     long_description = '\n' + f.read()
