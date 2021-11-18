@@ -192,7 +192,7 @@ def parse_args(command: str):
     return shlex.split(command)
 
 
-def get_container_name(spec):
+def get_container_name(spec, default: str):
     if 'annotations' in spec:
         annotations = spec['annotations']
         if 'io.kubernetes.cri.container-name' in annotations:
@@ -201,19 +201,22 @@ def get_container_name(spec):
         return spec['hostname']
     if 'id' in spec:
         return spec['id']
+    return default
 
 
 def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
-    tab, user = get_container_crontab(channel, container_id)
-    if tab == '':
-        return
-
     logger = logging.getLogger('cron')
     container_spec = get_container_spec(channel, container_id)
-    container_name = get_container_name(
-        container_spec) if not None else container_id
+    container_name = get_container_name(container_spec, container_id)
+
     logger.info(
         'load schedules from [{container_name}]...'.format(container_name=container_name))
+
+    tab, user = get_container_crontab(channel, container_id)
+    if tab == '':
+        logger.info('schedule not found in [{container_name}]'.format(
+            container_name=container_name))
+        return
 
     cron_jobs = CronTab(tab=tab, user=user)
     for job in cron_jobs:
