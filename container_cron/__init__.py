@@ -84,15 +84,20 @@ def mkfifo(exec_id: str):
     return fifo
 
 
-def run_command(channel, container_id, args, timeout=5) -> Tuple[int, str]:
+def get_container_spec(channel: grpc.Channel, container_id: str):
+    containers_stub = containers_pb2_grpc.ContainersStub(channel)
+    container = containers_stub.Get(containers_pb2.GetContainerRequest(
+        id=container_id), metadata=METADATA).container
+    return json.loads(container.spec.value)
+
+
+def run_command(channel: grpc.Channel, container_id: str, args, timeout=5) -> Tuple[int, str]:
     exec_id = "exec-" + hashsum(container_id + ': ' + str(args))
     stdout = mkfifo(exec_id)
     read_task = ReadTask(stdout)
 
-    containers_stub = containers_pb2_grpc.ContainersStub(channel)
-    container = containers_stub.Get(containers_pb2.GetContainerRequest(
-        id=container_id), metadata=METADATA).container
-    container_process = json.loads(container.spec.value)['process']
+    container_spec = get_container_spec(channel, container_id)
+    container_process = container_spec['process']
 
     process = {
         'args': args,
@@ -137,14 +142,14 @@ def run_command(channel, container_id, args, timeout=5) -> Tuple[int, str]:
     return exit_status, read_task.result()
 
 
-def run_schedule(channel, container_id, args):
+def run_schedule(channel: grpc.Channel, container_id: str, args):
     exit_code, _ = run_command(channel, container_id, args)
     logging.getLogger('cron').info(
-        "{code} <- schedule {schedule}".format(code=exit_code, schedule=shlex.join(args)))
+        "{code} <- schedule {schedule}".format(code=exit_code, schedule=' '.join(shlex.quote(arg) for arg in args)))
     return exit_code
 
 
-def get_os_id(channel, container_id):
+def get_os_id(channel: grpc.Channel, container_id: str):
     exit_code, output = run_command(
         channel, container_id, ["cat", "/etc/os-release"])
     if exit_code != 0:
@@ -153,7 +158,7 @@ def get_os_id(channel, container_id):
     return release['ID']
 
 
-def get_alpine_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
+def get_alpine_crontab(channel: grpc.Channel, container_id: str) -> Tuple[str, Union[str, bool]]:
     exit_code, output = run_command(
         channel, container_id, ['whoami'])
     if exit_code != 0:
@@ -166,7 +171,7 @@ def get_alpine_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
     return output.decode('utf8').replace('\t', ' '), user
 
 
-def get_debian_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
+def get_debian_crontab(channel: grpc.Channel, container_id: str) -> Tuple[str, Union[str, bool]]:
     exit_code, output = run_command(channel, container_id, ["/bin/sh", "-c",
                                                             '[ -d /etc/cron.d ] && find /etc/cron.d ! -name \".*\" -type f -exec cat \{\} \;'])
     if exit_code != 0:
@@ -174,7 +179,7 @@ def get_debian_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
     return output.decode('utf8').replace('\t', ' '), False
 
 
-def get_container_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
+def get_container_crontab(channel: grpc.Channel, container_id: str) -> Tuple[str, Union[str, bool]]:
     os_id = get_os_id(channel, container_id)
     if os_id == 'alpine':
         return get_alpine_crontab(channel, container_id)
@@ -187,10 +192,26 @@ def parse_args(command: str):
     return shlex.split(command)
 
 
+def get_container_name(spec):
+    if 'annotations' in spec:
+        annotations = spec['annotations']
+        if 'io.kubernetes.cri.container-name' in annotations:
+            return annotations['io.kubernetes.cri.container-name']
+    if 'hostname' in spec:
+        return spec['hostname']
+    if 'id' in spec:
+        return spec['id']
+
+
 def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
     tab, user = get_container_crontab(channel, container_id)
     if tab == '':
         return
+
+    logger = logging.getLogger('cron')
+    container_spec = get_container_spec(channel, container_id)
+    container_name = get_container_name(
+        container_spec) if not None else container_id
 
     cron_jobs = CronTab(tab=tab, user=user)
     for job in cron_jobs:
@@ -204,8 +225,11 @@ def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
                           args=[channel, container_id,
                                 parse_args(job.command)],
                           name=job.command)
-    logging.getLogger('cron').info(
-        'load schedules from {container_id}, {jobs} jobs now.'.format(container_id=container_id, jobs=len(scheduler.get_jobs())))
+        logger.info(
+            'found [{container_name}]: {job}.'.format(job=job.command, container_name=container_name))
+
+    logger.info(
+        'load schedules from [{container_name}], {jobs} jobs now.'.format(container_name=container_name, jobs=len(scheduler.get_jobs())))
 
 
 def unload_container_schedules(scheduler: BaseScheduler, container_id):
@@ -214,7 +238,7 @@ def unload_container_schedules(scheduler: BaseScheduler, container_id):
         if job.args[1] == container_id:
             scheduler.remove_job(job_id=job.id)
     logging.getLogger('cron').info(
-        'unload schedules from {container_id}, {jobs} jobs left.'.format(container_id=container_id, jobs=len(scheduler.get_jobs())))
+        'unload schedules from [{container_id}], {jobs} jobs left.'.format(container_id=container_id, jobs=len(scheduler.get_jobs())))
 
 
 def main():
@@ -240,15 +264,12 @@ def main():
     TIMEZONE = os.getenv('TIMEZONE', 'Asia/Shanghai')
 
     logging.basicConfig(stream=sys.stdout)
-    logging.getLogger('apscheduler').setLevel(logging.INFO)
+    logging.getLogger('apscheduler').setLevel(logging.ERROR)
     logging.getLogger('cron').setLevel(logging.INFO)
 
     scheduler = BackgroundScheduler(
         executors={'default': ThreadPoolExecutor(40)}, timezone=TIMEZONE)
-    try:
-        scheduler.start()
-    except:
-        pass
+    scheduler.start()
 
     with grpc.insecure_channel(cri_socket) as channel:
         containers_stub = containers_pb2_grpc.ContainersStub(channel)
