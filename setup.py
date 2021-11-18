@@ -6,7 +6,7 @@ from shutil import rmtree
 
 here = os.path.abspath(os.path.dirname(__file__))
 package = 'container_cron'
-version = '0.1.2'
+version = '0.2.0'
 
 with codecs.open(os.path.join(here, 'README.md')) as f:
     long_description = '\n' + f.read()
@@ -33,7 +33,8 @@ if sys.argv[-1] == 'publish':
 required = [
     'containerd>=1.5',
     'apscheduler>=3',
-    'python-crontab>=2'
+    'python-crontab>=2',
+    'python-dotenv>=0.19.2'
 ]
 
 setup(

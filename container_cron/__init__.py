@@ -7,9 +7,12 @@ import json
 import threading
 import time
 import getopt
+from typing import Tuple, Union
 
 from tempfile import gettempdir
 from crontab import CronTab
+from dotenv import dotenv_values
+from io import StringIO
 
 from containerd.services.containers.v1 import containers_pb2_grpc, containers_pb2
 from containerd.services.events.v1 import unwrap, events_pb2, events_pb2_grpc
@@ -35,6 +38,7 @@ def hashsum(str):
     md5 = hashlib.md5()
     md5.update(str.encode('utf-8'))
     return md5.hexdigest()
+
 
 class ReadTask(threading.Thread):
     abort_event: threading.Event
@@ -77,7 +81,7 @@ def mkfifo(exec_id: str):
     return fifo
 
 
-def run_command(channel, container_id, args, timeout=5):
+def run_command(channel, container_id, args, timeout=5) -> Tuple[int, str]:
     exec_id = "exec-" + hashsum(container_id + ': ' + str(args))
     stdout = mkfifo(exec_id)
     read_task = ReadTask(stdout)
@@ -136,21 +140,53 @@ def run_schedule(channel, container_id, args):
         "{code} <- schedule {schedule}".format(code=exit_code, schedule=' '.join(args)))
 
 
+def get_os_id(channel, container_id):
+    exit_code, output = run_command(
+        channel, container_id, ["cat", "/etc/os-release"])
+    if exit_code != 0:
+        return
+    release = dotenv_values(stream=StringIO(output.decode('utf8')))
+    return release['ID']
+
+
+def get_alpine_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
+    exit_code, output = run_command(
+        channel, container_id, ['whoami'])
+    if exit_code != 0:
+        return '', None
+    user = output.decode('utf8').replace('\n', '')
+    exit_code, output = run_command(
+        channel, container_id, ['cat', '/etc/crontabs/{user}'.format(user=user)])
+    if exit_code != 0:
+        return '', None
+    return output.decode('utf8').replace('\t', ' '), user
+
+def get_debian_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
+    exit_code, output = run_command(channel, container_id, ["/bin/sh", "-c",
+                                                            '[ -d /etc/cron.d ] && find /etc/cron.d ! -name \".*\" -type f -exec cat \{\} \;'])
+    if exit_code != 0:
+        return '', None
+    return output.decode('utf8').replace('\t', ' '), False
+
+
+def get_container_crontab(channel, container_id) -> Tuple[str, Union[str, bool]]:
+    os_id = get_os_id(channel, container_id)
+    if os_id == 'alpine':
+        return get_alpine_crontab(channel, container_id)
+    elif os_id == 'debian' or os_id == 'ubuntu':
+        return get_debian_crontab(channel, container_id)
+    return '', None
+
+
 def load_container_schedules(scheduler, container_id, channel):
     logging.getLogger('cron').info(
         'load schedules from {container_id}'.format(container_id=container_id))
 
-    args = ["/bin/sh", "-c",
-            '[ -d /etc/cron.d ] && find /etc/cron.d ! -name \".*\" -type f -exec cat \{\} \;']
-    exit_code, output = run_command(channel, container_id, args)
-    if exit_code != 0:
-        return
-
-    tab = output.decode('utf8').replace('\t', ' ')
+    tab, user = get_container_crontab(channel, container_id)
     if tab == '':
         return
 
-    cron_jobs = CronTab(tab=tab, user=False)
+    cron_jobs = CronTab(tab=tab, user=user)
     for job in cron_jobs:
         if not job.is_enabled():
             continue
@@ -175,15 +211,16 @@ def unload_container_schedules(scheduler, container_id):
 
 def main():
     try:
-        opts, args = getopt.getopt(sys.argv[1:], 's:n:', ['cri-socket=', 'namespace='])
+        opts, args = getopt.getopt(sys.argv[1:], 's:n:', [
+                                   'cri-socket=', 'namespace='])
     except getopt.GetoptError as e:
         print('Usage: --cri-socket|-s <SOCKET> --namespace|-n <NAMESPACE>')
         exit(1)
 
     cri_socket = 'unix:///run/containerd/containerd.sock'
-    namespace = 'k8s.io' # moby for docker
+    namespace = 'k8s.io'  # moby for docker
 
-    for k,v in opts:
+    for k, v in opts:
         if k == '--cri-socket' or k == '-s':
             cri_socket = 'unix://' + v if v.startswith('/') else v
         elif k == '--namespace' or k == '-n':
