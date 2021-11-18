@@ -189,6 +189,7 @@ def main():
         elif k == '--namespace' or k == '-n':
             namespace = v
 
+    global METADATA
     METADATA = (('containerd-namespace', namespace),)
 
     TIMEZONE = os.getenv('TIMEZONE', 'Asia/Shanghai')
