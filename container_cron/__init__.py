@@ -1,7 +1,6 @@
 import os
 import sys
 import logging
-import hashlib
 import grpc
 import json
 import threading
@@ -11,7 +10,6 @@ import shlex
 
 from typing import Tuple, Union
 
-from tempfile import gettempdir
 from crontab import CronTab
 from dotenv import dotenv_values
 from io import StringIO
@@ -36,12 +34,7 @@ SPECIALS = {"reboot":   '@reboot',
 
 METADATA = (('containerd-namespace', 'k8s.io'),)
 
-
-def hashsum(str):
-    md5 = hashlib.md5()
-    md5.update(str.encode('utf-8'))
-    return md5.hexdigest()
-
+FIFO_DIR = '/tmp/containerd-fifo'
 
 class ReadTask(threading.Thread):
     abort_event: threading.Event
@@ -73,16 +66,18 @@ class ReadTask(threading.Thread):
             self.join()
         return self.output
 
-
-def mkfifo(exec_id: str):
-    fifo = gettempdir() + '/' + exec_id
+def rmfifo(exec_id: str):
+    fifo = FIFO_DIR + '/' + exec_id
     try:
         os.unlink(fifo)
     except:
         pass
-    os.mkfifo(fifo)
     return fifo
 
+def mkfifo(exec_id: str):
+    fifo = rmfifo(exec_id)
+    os.mkfifo(fifo)
+    return fifo
 
 def get_container_spec(channel: grpc.Channel, container_id: str):
     containers_stub = containers_pb2_grpc.ContainersStub(channel)
@@ -90,9 +85,8 @@ def get_container_spec(channel: grpc.Channel, container_id: str):
         id=container_id), metadata=METADATA).container
     return json.loads(container.spec.value)
 
-
 def run_command(channel: grpc.Channel, container_id: str, args, timeout=5) -> Tuple[int, str]:
-    exec_id = "exec-" + hashsum(container_id + ': ' + str(args))
+    exec_id = "exec-" + os.urandom(16).hex()
     stdout = mkfifo(exec_id)
     read_task = ReadTask(stdout)
 
@@ -139,7 +133,9 @@ def run_command(channel: grpc.Channel, container_id: str, args, timeout=5) -> Tu
     except:
         exit_status = 1
 
-    return exit_status, read_task.result()
+    result = read_task.result()
+    rmfifo(exec_id)
+    return exit_status, result
 
 
 def run_schedule(channel: grpc.Channel, container_id: str, args):
@@ -193,6 +189,14 @@ def parse_args(command: str):
 
 
 def get_container_name(spec, default: str):
+    if 'process' in spec:
+        process = spec['process']
+        if 'env' in process:
+            hostname_var: str = next(filter(lambda v: v.startswith('HOSTNAME='), process['env']), None)
+            if hostname_var:
+                _, hostname = hostname_var.split('=', 2)
+                if hostname:
+                    return hostname
     if 'annotations' in spec:
         annotations = spec['annotations']
         if 'io.kubernetes.cri.container-name' in annotations:
@@ -250,9 +254,11 @@ def unload_container_schedules(scheduler: BaseScheduler, container_id):
 
 
 def main():
+    global METADATA, FIFO_DIR
+
     try:
         opts, _ = getopt.getopt(sys.argv[1:], 's:n:', [
-            'cri-socket=', 'namespace='])
+            'cri-socket=', 'namespace=', 'fifo-dir='])
     except getopt.GetoptError as e:
         print('Usage: --cri-socket|-s <SOCKET> --namespace|-n <NAMESPACE>')
         exit(1)
@@ -265,11 +271,13 @@ def main():
             cri_socket = 'unix://' + v if v.startswith('/') else v
         elif k == '--namespace' or k == '-n':
             namespace = v
+        elif k == '--fifo-dir':
+            FIFO_DIR = v
 
-    global METADATA
     METADATA = (('containerd-namespace', namespace),)
-
     TIMEZONE = os.getenv('TIMEZONE', 'Asia/Shanghai')
+
+    os.makedirs(FIFO_DIR, exist_ok=True)
 
     logging.basicConfig(stream=sys.stdout)
     logging.getLogger('apscheduler').setLevel(logging.ERROR)
@@ -280,11 +288,10 @@ def main():
     scheduler.start()
 
     with grpc.insecure_channel(cri_socket) as channel:
-        containers_stub = containers_pb2_grpc.ContainersStub(channel)
-        containers = containers_stub.List(
-            containers_pb2.ListContainersRequest(), metadata=METADATA).containers
-        for container in containers:
-            load_container_schedules(scheduler, container.id, channel)
+        tasks_stub = tasks_pb2_grpc.TasksStub(channel)
+        tasks = tasks_stub.List(tasks_pb2.ListTasksRequest(filter='{.status=RUNNING}'), metadata=METADATA).tasks
+        for task in tasks:
+            load_container_schedules(scheduler, task.id, channel)
 
         events_stub = events_pb2_grpc.EventsStub(channel)
         for ev in events_stub.Subscribe(events_pb2.SubscribeRequest()):
@@ -293,7 +300,6 @@ def main():
                 load_container_schedules(scheduler, v.container_id, channel)
             elif ev.event.type_url == 'containerd.events.TaskDelete':
                 unload_container_schedules(scheduler, v.container_id)
-
 
 if __name__ == "__main__":
     main()
