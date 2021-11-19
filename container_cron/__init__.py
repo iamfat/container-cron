@@ -36,6 +36,7 @@ METADATA = (('containerd-namespace', 'k8s.io'),)
 
 FIFO_DIR = '/tmp/containerd-fifo'
 
+
 class ReadTask(threading.Thread):
     abort_event: threading.Event
     output: bytearray
@@ -66,6 +67,7 @@ class ReadTask(threading.Thread):
             self.join()
         return self.output
 
+
 def rmfifo(exec_id: str):
     fifo = FIFO_DIR + '/' + exec_id
     try:
@@ -74,16 +76,19 @@ def rmfifo(exec_id: str):
         pass
     return fifo
 
+
 def mkfifo(exec_id: str):
     fifo = rmfifo(exec_id)
     os.mkfifo(fifo)
     return fifo
+
 
 def get_container_spec(channel: grpc.Channel, container_id: str):
     containers_stub = containers_pb2_grpc.ContainersStub(channel)
     container = containers_stub.Get(containers_pb2.GetContainerRequest(
         id=container_id), metadata=METADATA).container
     return json.loads(container.spec.value)
+
 
 def run_command(channel: grpc.Channel, container_id: str, args, timeout=5) -> Tuple[int, str]:
     exec_id = "exec-" + os.urandom(16).hex()
@@ -145,43 +150,39 @@ def run_schedule(channel: grpc.Channel, container_id: str, args):
     return exit_code
 
 
-def get_os_id(channel: grpc.Channel, container_id: str):
-    exit_code, output = run_command(
-        channel, container_id, ["cat", "/etc/os-release"])
-    if exit_code != 0:
-        return
-    release = dotenv_values(stream=StringIO(output.decode('utf8')))
-    return release['ID']
+# def get_os_id(channel: grpc.Channel, container_id: str):
+#     exit_code, output = run_command(
+#         channel, container_id, ["cat", "/etc/os-release"])
+#     if exit_code != 0:
+#         return
+#     release = dotenv_values(stream=StringIO(output.decode('utf8')))
+#     return release['ID']
 
 
-def get_alpine_crontab(channel: grpc.Channel, container_id: str) -> Tuple[str, Union[str, bool]]:
+def get_current_user(channel: grpc.Channel, container_id: str) -> str:
     exit_code, output = run_command(
         channel, container_id, ['whoami'])
-    if exit_code != 0:
-        return '', None
-    user = output.decode('utf8').replace('\n', '')
+    if exit_code == 0:
+        return output.decode('utf8').replace('\n', '')
+    return 'root'
+
+
+def get_user_crontab(channel: grpc.Channel, container_id: str, user: str) -> CronTab:
     exit_code, output = run_command(
         channel, container_id, ['cat', '/etc/crontabs/{user}'.format(user=user)])
     if exit_code != 0:
-        return '', None
-    return output.decode('utf8').replace('\t', ' '), user
+        return None
+    tab = output.decode('utf8').replace('\t', ' ')
+    return CronTab(tab=tab, user=user)
 
 
-def get_debian_crontab(channel: grpc.Channel, container_id: str) -> Tuple[str, Union[str, bool]]:
+def get_system_crontab(channel: grpc.Channel, container_id: str) -> CronTab:
     exit_code, output = run_command(channel, container_id, ["/bin/sh", "-c",
                                                             '[ -d /etc/cron.d ] && find /etc/cron.d ! -name \".*\" -type f -exec cat \{\} \;'])
     if exit_code != 0:
-        return '', None
-    return output.decode('utf8').replace('\t', ' '), False
-
-
-def get_container_crontab(channel: grpc.Channel, container_id: str) -> Tuple[str, Union[str, bool]]:
-    os_id = get_os_id(channel, container_id)
-    if os_id == 'alpine':
-        return get_alpine_crontab(channel, container_id)
-    elif os_id == 'debian' or os_id == 'ubuntu':
-        return get_debian_crontab(channel, container_id)
-    return '', None
+        return None
+    tab = output.decode('utf8').replace('\t', ' ')
+    return CronTab(tab=tab, user=False)
 
 
 def parse_args(command: str):
@@ -192,7 +193,8 @@ def get_container_name(spec, default: str):
     if 'process' in spec:
         process = spec['process']
         if 'env' in process:
-            hostname_var: str = next(filter(lambda v: v.startswith('HOSTNAME='), process['env']), None)
+            hostname_var: str = next(
+                filter(lambda v: v.startswith('HOSTNAME='), process['env']), None)
             if hostname_var:
                 _, hostname = hostname_var.split('=', 2)
                 if hostname:
@@ -208,22 +210,10 @@ def get_container_name(spec, default: str):
     return default
 
 
-def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
+def crontab_to_schedule(channel: grpc.Channel, container_id: str, crontab: CronTab, scheduler: BaseScheduler):
     logger = logging.getLogger('cron')
-    container_spec = get_container_spec(channel, container_id)
-    container_name = get_container_name(container_spec, container_id)
-
-    logger.info(
-        'load schedules from [{container_name}]...'.format(container_name=container_name))
-
-    tab, user = get_container_crontab(channel, container_id)
-    if tab == '':
-        logger.info('schedule not found in [{container_name}]'.format(
-            container_name=container_name))
-        return
-
-    cron_jobs = CronTab(tab=tab, user=user)
-    for job in cron_jobs:
+    added = 0
+    for job in crontab:
         if not job.is_enabled():
             continue
         slices = str(job.slices)
@@ -235,13 +225,40 @@ def load_container_schedules(scheduler: BaseScheduler, container_id, channel):
                                 parse_args(job.command)],
                           name=job.command)
         logger.debug(
-            'found [{container_name}]: {job}.'.format(job=job.command, container_name=container_name))
+            'found {job}.'.format(job=job.command))
+        added += 1
+    return added
+
+
+def load_container_schedules(channel: grpc.Channel, container_id: str, scheduler: BaseScheduler):
+    logger = logging.getLogger('cron')
+    container_spec = get_container_spec(channel, container_id)
+    container_name = get_container_name(container_spec, container_id)
 
     logger.info(
-        'got {job_count} schedules now.'.format(job_count=len(scheduler.get_jobs())))
+        'load schedules from [{container_name}]...'.format(container_name=container_name))
+
+    added = 0
+    user = get_current_user(channel, container_id)
+    user_crontab = get_user_crontab(channel, container_id, user)
+    if user_crontab:
+        added += crontab_to_schedule(channel,
+                                     container_id, user_crontab, scheduler)
+
+    system_crontab = get_system_crontab(channel, container_id)
+    if system_crontab:
+        added += crontab_to_schedule(channel,
+                                     container_id, system_crontab, scheduler)
+
+    if added == 0:
+        logger.info('schedule not found in [{container_name}]'.format(
+            container_name=container_name))
+    else:
+        logger.info(
+            'got {job_count} schedules now.'.format(job_count=len(scheduler.get_jobs())))
 
 
-def unload_container_schedules(scheduler: BaseScheduler, container_id):
+def unload_container_schedules(channel: grpc.Channel, container_id: str, scheduler: BaseScheduler):
     jobs = scheduler.get_jobs()
     job_count = len(jobs)
     for job in jobs:
@@ -289,17 +306,19 @@ def main():
 
     with grpc.insecure_channel(cri_socket) as channel:
         tasks_stub = tasks_pb2_grpc.TasksStub(channel)
-        tasks = tasks_stub.List(tasks_pb2.ListTasksRequest(filter='{.status=RUNNING}'), metadata=METADATA).tasks
+        tasks = tasks_stub.List(tasks_pb2.ListTasksRequest(
+            filter='{.status=RUNNING}'), metadata=METADATA).tasks
         for task in tasks:
-            load_container_schedules(scheduler, task.id, channel)
+            load_container_schedules(channel, task.id, scheduler)
 
         events_stub = events_pb2_grpc.EventsStub(channel)
         for ev in events_stub.Subscribe(events_pb2.SubscribeRequest()):
             v = unwrap(ev)
             if ev.event.type_url == 'containerd.events.TaskCreate':
-                load_container_schedules(scheduler, v.container_id, channel)
+                load_container_schedules(channel, v.container_id, scheduler)
             elif ev.event.type_url == 'containerd.events.TaskDelete':
-                unload_container_schedules(scheduler, v.container_id)
+                unload_container_schedules(channel, v.container_id, scheduler)
+
 
 if __name__ == "__main__":
     main()
