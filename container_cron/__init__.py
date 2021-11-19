@@ -248,7 +248,7 @@ def load_container_schedules(channel: grpc.Channel, container_id: str, scheduler
     system_crontab = get_system_crontab(channel, container_id)
     if system_crontab:
         added += crontab_to_schedule(channel,
-                                     container_id, system_crontab, scheduler)
+                                     container_id, filter(lambda it: it.user == user, system_crontab), scheduler)
 
     if added == 0:
         logger.info('schedule not found in [{container_name}]'.format(
